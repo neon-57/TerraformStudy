@@ -1,0 +1,13 @@
+{
+  "name": "express-serverless",
+  "version": "1.0.0",
+  "description": "A simple Express server running on AWS Lambda using serverless-http",
+  "type": "module",
+  "dependencies": {
+    "express": "^5.1.0",
+    "serverless-http": "^3.2.0"
+  },
+  "scripts": {
+    "dev": "node ./development.js"
+  }
+}
