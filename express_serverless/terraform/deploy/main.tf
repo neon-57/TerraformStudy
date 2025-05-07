@@ -7,13 +7,18 @@ locals {
 #
 # 1. ECR リポジトリ
 #
-resource "aws_ecr_repository" "this" {
+import {                       # 既に存在する ECR リポジトリをインポート
+  to = aws_ecr_repository.this # インポート先リソース
+  id = var.repo_name           # ECR のリポジトリ名（=ID）
+}
+resource "aws_ecr_repository" "this" { # なければ新規作成
   name                 = var.repo_name
-  image_tag_mutability = "IMMUTABLE"
-  image_scanning_configuration { scan_on_push = true }
+  image_tag_mutability = "MUTABLE"
+  image_scanning_configuration { # セキュリティスキャン
+    scan_on_push = true
+  }
 
-  #
-  force_delete = true
+  force_delete = true # リポジトリを削除する際、イメージが残っていても強制削除できるようにする。
 }
 
 #
@@ -32,9 +37,8 @@ resource "docker_image" "app" {
     }
   }
 
-  triggers = {
-    lambda_js_sha  = filesha256("${path.module}/../../lambda.js")
-    dockerfile_sha = filesha256("${path.module}/../../Dockerfile")
+  triggers = { # 変更がなくとも、強制的にビルドする
+    always = timestamp()
   }
 }
 
@@ -42,13 +46,17 @@ resource "docker_image" "app" {
 resource "docker_registry_image" "app" {
   name          = docker_image.app.name
   keep_remotely = true
+
+  lifecycle {
+    replace_triggered_by = [docker_image.app] # build が変われば強制置換
+  }
 }
 
 #
 # 3. イメージの digest を確定させる
 #
 data "aws_ecr_image" "app" {
-  repository_name = aws_ecr_repository.this.name
+  repository_name = var.repo_name
   image_tag       = var.image_tag
   depends_on      = [docker_registry_image.app]
 }
@@ -79,6 +87,10 @@ resource "aws_iam_role_policy_attachment" "basic_exec" {
 #
 # 5. Lambda (コンテナイメージ)
 #
+import {                            # 既に存在する Function URL をインポート
+  to = aws_lambda_function_url.this # インポート先リソース
+  id = var.function_name
+}
 resource "aws_lambda_function" "this" {
   function_name = var.function_name
   package_type  = "Image"
@@ -88,10 +100,6 @@ resource "aws_lambda_function" "this" {
   architectures = ["arm64"]
   memory_size   = var.memory_size
   timeout       = var.timeout
-
-  lifecycle {
-    ignore_changes = [image_uri]
-  }
 }
 
 #
@@ -99,7 +107,17 @@ resource "aws_lambda_function" "this" {
 #
 resource "aws_lambda_function_url" "this" {
   function_name      = aws_lambda_function.this.function_name
-  authorization_type = "NONE"
+  authorization_type = "AWS_IAM" # 直接のアクセスを許可しない
+}
+
+# CloudFront だけに Function URL への Invoke 権限を付与
+resource "aws_lambda_permission" "allow_cf" {
+  statement_id  = "AllowCloudFrontInvoke"
+  action        = "lambda:InvokeFunctionUrl"
+  function_name = aws_lambda_function.this.function_name
+  principal     = "cloudfront.amazonaws.com"
+  # CloudFront ディストリビューション ARN を制限
+  source_arn = aws_cloudfront_distribution.this.arn
 }
 
 #
@@ -108,7 +126,7 @@ resource "aws_lambda_function_url" "this" {
 resource "aws_cloudfront_origin_access_control" "lambda_oac" {
   name                              = "${var.function_name}-oac"
   origin_access_control_origin_type = "lambda"
-  signing_behavior                  = "never"
+  signing_behavior                  = "always"
   signing_protocol                  = "sigv4"
 }
 
@@ -154,4 +172,24 @@ resource "aws_cloudfront_distribution" "this" {
   viewer_certificate {
     cloudfront_default_certificate = true
   }
+}
+
+# Digest が変わるたびにキャッシュ無効化
+resource "null_resource" "reset_cache" {
+  # ── Lambda イメージの digest が変わったら作り直し ──
+  triggers = {
+    digest = data.aws_ecr_image.app.image_digest
+  }
+
+  provisioner "local-exec" {
+    # AWS CLI v2 が実行環境に入っている前提
+    command = <<EOT
+aws cloudfront create-invalidation \
+  --distribution-id ${aws_cloudfront_distribution.this.id} \
+  --paths '/*'
+EOT
+  }
+
+  # Lambda 更新が完了してから無効化を走らせる
+  depends_on = [aws_lambda_function.this]
 }

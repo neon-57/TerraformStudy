@@ -4,7 +4,7 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.send('Hello from ES Modules + Lambda!');
+  res.send('Hello, World!');
 });
 
 export default app;

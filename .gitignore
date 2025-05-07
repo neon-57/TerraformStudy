@@ -2,4 +2,5 @@
 .terraform*
 *.tfstate*
 *node_modules
-.vscode
+.vscode/settings.json
+*.tfvars
