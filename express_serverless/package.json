@@ -4,7 +4,9 @@
   "description": "A simple Express server running on AWS Lambda using serverless-http",
   "type": "module",
   "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.804.0",
     "express": "^5.1.0",
+    "pg": "^8.15.6",
     "serverless-http": "^3.2.0"
   },
   "scripts": {

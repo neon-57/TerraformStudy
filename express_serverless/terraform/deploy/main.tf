@@ -1,74 +1,88 @@
+###############################################################################
+# Terraform & Provider
+###############################################################################
+terraform {
+  required_version = ">= 1.8.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.50"
+    }
+    docker = {
+      source  = "kreuzwerker/docker"
+      version = "~> 3.0"
+    }
+  }
+}
+
 locals {
   account_id     = data.aws_caller_identity.current.account_id
   image_uri      = "${local.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/${var.repo_name}:${var.image_tag}"
   repository_url = aws_ecr_repository.this.repository_url
 }
 
-#
-# 1. ECR リポジトリ
-#
-import {                       # 既に存在する ECR リポジトリをインポート
-  to = aws_ecr_repository.this # インポート先リソース
-  id = var.repo_name           # ECR のリポジトリ名（=ID）
+###############################################################################
+# 1. ECR リポジトリ（既存なら import で取り込む）
+###############################################################################
+import {
+  to = aws_ecr_repository.this
+  id = var.repo_name                     # 既存リポジトリ名
 }
-resource "aws_ecr_repository" "this" { # なければ新規作成
+
+resource "aws_ecr_repository" "this" {
   name                 = var.repo_name
   image_tag_mutability = "MUTABLE"
-  image_scanning_configuration { # セキュリティスキャン
+
+  image_scanning_configuration {
     scan_on_push = true
   }
 
-  force_delete = true # リポジトリを削除する際、イメージが残っていても強制削除できるようにする。
+  force_delete = true
 }
 
-#
+###############################################################################
 # 2. Docker buildx → push
-#
+###############################################################################
 resource "docker_image" "app" {
   name = local.image_uri
 
   build {
-    context    = "${path.module}/../.." # ルートに Dockerfile/lambda.js がある場合
+    context    = "${path.module}/../.."   # ルートに Dockerfile がある想定
     dockerfile = "Dockerfile"
     platform   = "linux/arm64"
-    # BuildKit の provenance を切る
+
+    # BuildKit provenance を切る（--provenance=false）
     label = {
       "org.opencontainers.image.source" = "terraform"
     }
   }
 
-  triggers = { # 変更がなくとも、強制的にビルドする
-    always = timestamp()
-  }
+  # 変更がなくとも毎回ビルドしたい場合
+  triggers = { always = timestamp() }
 }
 
-# push
 resource "docker_registry_image" "app" {
   name          = docker_image.app.name
   keep_remotely = true
 
   lifecycle {
-    replace_triggered_by = [docker_image.app] # build が変われば強制置換
+    replace_triggered_by = [docker_image.app]
   }
 }
 
-#
-# 3. イメージの digest を確定させる
-#
+###############################################################################
+# 3. イメージ digest を取得
+###############################################################################
 data "aws_ecr_image" "app" {
   repository_name = var.repo_name
   image_tag       = var.image_tag
   depends_on      = [docker_registry_image.app]
 }
 
-#
+###############################################################################
 # 4. IAM ロール
-#
-resource "aws_iam_role" "lambda_exec" {
-  name               = "${var.function_name}-exec"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
-}
-
+###############################################################################
 data "aws_iam_policy_document" "lambda_assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -79,50 +93,63 @@ data "aws_iam_policy_document" "lambda_assume" {
   }
 }
 
+resource "aws_iam_role" "lambda_exec" {
+  name               = "${var.function_name}-exec"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
 resource "aws_iam_role_policy_attachment" "basic_exec" {
   role       = aws_iam_role.lambda_exec.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-#
-# 5. Lambda (コンテナイメージ)
-#
-import {                            # 既に存在する Function URL をインポート
-  to = aws_lambda_function_url.this # インポート先リソース
-  id = var.function_name
-}
+###############################################################################
+# 5. Lambda（コンテナイメージ）
+###############################################################################
 resource "aws_lambda_function" "this" {
   function_name = var.function_name
   package_type  = "Image"
-  # タグを外して、ダイジェストのみで指定
   image_uri     = "${local.repository_url}@${data.aws_ecr_image.app.image_digest}"
+
   role          = aws_iam_role.lambda_exec.arn
   architectures = ["arm64"]
   memory_size   = var.memory_size
   timeout       = var.timeout
+
+  # ── VPC 接続（RDS 用） ──
+  vpc_config {
+    subnet_ids         = data.aws_subnets.default.ids
+    security_group_ids = [aws_security_group.lambda.id]
+  }
+
+  depends_on = [aws_ecr_repository.this]
 }
 
-#
+###############################################################################
 # 6. Function URL
-#
+###############################################################################
+import {
+  to = aws_lambda_function_url.this
+  id = var.function_name               # 既存 Function URL を取り込む場合
+}
+
 resource "aws_lambda_function_url" "this" {
   function_name      = aws_lambda_function.this.function_name
-  authorization_type = "AWS_IAM" # 直接のアクセスを許可しない
+  authorization_type = "AWS_IAM"       # 直接呼ばせず CloudFront からのみ
 }
 
-# CloudFront だけに Function URL への Invoke 権限を付与
+# CloudFront だけに URL Invoke を許可
 resource "aws_lambda_permission" "allow_cf" {
   statement_id  = "AllowCloudFrontInvoke"
   action        = "lambda:InvokeFunctionUrl"
   function_name = aws_lambda_function.this.function_name
   principal     = "cloudfront.amazonaws.com"
-  # CloudFront ディストリビューション ARN を制限
-  source_arn = aws_cloudfront_distribution.this.arn
+  source_arn    = aws_cloudfront_distribution.this.arn
 }
 
-#
-# 7. CloudFront (オリジン: Lambda Function URL)
-#
+###############################################################################
+# 7. CloudFront（オリジン: Function URL）
+###############################################################################
 resource "aws_cloudfront_origin_access_control" "lambda_oac" {
   name                              = "${var.function_name}-oac"
   origin_access_control_origin_type = "lambda"
@@ -159,9 +186,10 @@ resource "aws_cloudfront_distribution" "this" {
     viewer_protocol_policy = "redirect-to-https"
     allowed_methods        = ["GET", "HEAD", "OPTIONS"]
     cached_methods         = ["GET", "HEAD"]
+
     forwarded_values {
       query_string = true
-      cookies { forward = "none" }
+      cookies      { forward = "none" }
     }
   }
 
@@ -169,20 +197,20 @@ resource "aws_cloudfront_distribution" "this" {
     geo_restriction { restriction_type = "none" }
   }
 
-  viewer_certificate {
-    cloudfront_default_certificate = true
-  }
+  viewer_certificate { cloudfront_default_certificate = true }
 }
 
-# Digest が変わるたびにキャッシュ無効化
+# イメージ更新時にキャッシュ無効化
 resource "null_resource" "reset_cache" {
-  # ── Lambda イメージの digest が変わったら作り直し ──
-  triggers = {
-    digest = data.aws_ecr_image.app.image_digest
+  triggers = { digest = data.aws_ecr_image.app.image_digest }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = "echo Skip invalidation on destroy"
   }
 
   provisioner "local-exec" {
-    # AWS CLI v2 が実行環境に入っている前提
+    when    = create
     command = <<EOT
 aws cloudfront create-invalidation \
   --distribution-id ${aws_cloudfront_distribution.this.id} \
@@ -190,6 +218,107 @@ aws cloudfront create-invalidation \
 EOT
   }
 
-  # Lambda 更新が完了してから無効化を走らせる
   depends_on = [aws_lambda_function.this]
+}
+
+###############################################################################
+# 8. ネットワーク（Default VPC で簡易構成）
+###############################################################################
+data "aws_vpc" "default" { default = true }
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+
+# Lambda 用 SG
+resource "aws_security_group" "lambda" {
+  name        = "${var.function_name}-lambda-sg"
+  description = "Outbound-only for Lambda"
+  vpc_id      = data.aws_vpc.default.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# RDS 用 SG
+resource "aws_security_group" "db" {
+  name        = "${var.function_name}-db-sg"
+  description = "Allow Lambda access to RDS"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.lambda.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+###############################################################################
+# 9. RDS
+###############################################################################
+resource "aws_db_subnet_group" "default" {
+  name       = "${var.function_name}-db-subnets"
+  subnet_ids = data.aws_subnets.default.ids
+}
+
+resource "aws_db_instance" "this" {
+  identifier              = "${var.function_name}-db"
+  engine                  = var.db_engine
+  instance_class          = var.db_instance_class
+  allocated_storage       = var.db_allocated_storage
+
+  username                = var.db_username
+  password                = var.db_password
+
+  db_subnet_group_name    = aws_db_subnet_group.default.name
+  vpc_security_group_ids  = [aws_security_group.db.id]
+
+  skip_final_snapshot     = true
+}
+
+###############################################################################
+# 10. Secrets Manager（DB 接続情報を格納）
+###############################################################################
+resource "aws_secretsmanager_secret" "db" {
+  name = "${var.function_name}-db-uri"
+}
+
+resource "aws_secretsmanager_secret_version" "db" {
+  secret_id     = aws_secretsmanager_secret.db.id
+  secret_string = jsonencode({
+    username = var.db_username
+    password = var.db_password
+    host     = aws_db_instance.this.address
+    port     = aws_db_instance.this.port
+    dbname   = var.db_name
+  })
+}
+
+###############################################################################
+# 11. Outputs
+###############################################################################
+output "function_url" {
+  value = aws_lambda_function_url.this.function_url
+}
+
+output "cloudfront_domain" {
+  value = aws_cloudfront_distribution.this.domain_name
+}
+
+output "repository_url" {
+  value = aws_ecr_repository.this.repository_url
 }
